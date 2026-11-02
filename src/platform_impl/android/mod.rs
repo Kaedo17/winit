@@ -7,7 +7,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use android_activity::input::{
-    Axis, InputEvent, KeyAction, Keycode, MotionAction, MotionEvent, Source,
+    Axis, InputEvent, KeyAction, Keycode, MetaState, MotionAction, MotionEvent, Source,
 };
 use android_activity::{
     AndroidApp, AndroidAppWaker, ConfigurationRef, InputStatus, MainEvent, Rect,
@@ -20,6 +20,7 @@ use crate::error;
 use crate::error::EventLoopError;
 use crate::event::{self, Force, InnerSizeWriter, StartCause};
 use crate::event_loop::{self, ActiveEventLoop as RootAEL, ControlFlow, DeviceEvents};
+use crate::keyboard::ModifiersState;
 use crate::platform::pump_events::PumpStatus;
 use crate::platform_impl::Fullscreen;
 use crate::window::{
@@ -133,6 +134,18 @@ impl RedrawRequester {
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct KeyEventExtra {}
 
+/// The modifiers carried by an Android key or motion event. Android reports the state per event
+/// rather than tracking it globally, so its bits name the key side that changed the state; winit's
+/// state is side-free, and each side bit folds into the modifier it belongs to.
+fn android_modifiers(meta: MetaState) -> ModifiersState {
+    let mut state = ModifiersState::empty();
+    state.set(ModifiersState::SHIFT, meta.shift_on());
+    state.set(ModifiersState::CONTROL, meta.ctrl_on());
+    state.set(ModifiersState::ALT, meta.alt_on());
+    state.set(ModifiersState::SUPER, meta.meta_on());
+    state
+}
+
 pub struct EventLoop<T: 'static> {
     pub(crate) android_app: AndroidApp,
     window_target: event_loop::ActiveEventLoop,
@@ -145,6 +158,10 @@ pub struct EventLoop<T: 'static> {
     cause: StartCause,
     ignore_volume_keys: bool,
     combining_accent: Option<char>,
+    /// The modifier state last dispatched. winit 0.30 moved modifiers out of `KeyEvent` into
+    /// `WindowEvent::ModifiersChanged`, which this backend never sent, so on Android the state
+    /// reached nothing and every chord key read as plain text.
+    modifiers: ModifiersState,
     /// The mouse buttons this press gesture has reported down, as [`Self::BUTTONS`] bits: `Down`
     /// says which button started the gesture (Android reports *any* first button as `Down`, with
     /// the button in the event's state), while the matching `Up` has already cleared that state.
@@ -267,6 +284,7 @@ impl<T: 'static> EventLoop<T> {
             cause: StartCause::Init,
             ignore_volume_keys: attributes.ignore_volume_keys,
             combining_accent: None,
+            modifiers: ModifiersState::empty(),
             mouse_buttons: Cell::new(0),
         })
     }
@@ -539,6 +557,22 @@ impl<T: 'static> EventLoop<T> {
                         input_status = InputStatus::Unhandled
                     },
                     keycode => {
+                        // Android carries the modifiers inside the key event, so the change has to
+                        // be dispatched *before* the key event it belongs to: consumers read the
+                        // state as they convert a key, so a chord key arriving first is converted
+                        // as plain text. Only a real change is dispatched, so an idle device keeps
+                        // producing no events and the app can idle (storytold/effectcraft#2359).
+                        let modifiers = android_modifiers(key.meta_state());
+                        if modifiers != self.modifiers {
+                            self.modifiers = modifiers;
+                            callback(
+                                event::Event::WindowEvent {
+                                    window_id: window::WindowId(WindowId),
+                                    event: event::WindowEvent::ModifiersChanged(modifiers.into()),
+                                },
+                                self.window_target(),
+                            );
+                        }
                         let state = match key.action() {
                             KeyAction::Down => event::ElementState::Pressed,
                             KeyAction::Up => event::ElementState::Released,
